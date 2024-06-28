@@ -3,11 +3,11 @@ module github.com/alist-org/alist/v3
 go 1.21
 
 require (
-	github.com/Mikubill/gofakes3 v0.0.3-0.20230622102024-284c0f988700
 	github.com/SheltonZhu/115driver v1.0.22
 	github.com/Xhofe/go-cache v0.0.0-20220723083548-714439c8af9a
 	github.com/Xhofe/rateg v0.0.0-20230728072201-251a4e1adad4
 	github.com/Xhofe/wopan-sdk-go v0.1.2
+	github.com/alist-org/gofakes3 v0.0.4
 	github.com/aliyun/aliyun-oss-go-sdk v3.0.2+incompatible
 	github.com/avast/retry-go v3.0.0+incompatible
 	github.com/aws/aws-sdk-go v1.50.24
@@ -18,11 +18,12 @@ require (
 	github.com/charmbracelet/lipgloss v0.9.1
 	github.com/coreos/go-oidc v2.2.1+incompatible
 	github.com/deckarep/golang-set/v2 v2.6.0
+	github.com/dhowden/tag v0.0.0-20240417053706-3d75831295e8
 	github.com/disintegration/imaging v1.6.2
 	github.com/djherbis/times v1.6.0
 	github.com/dlclark/regexp2 v1.10.0
 	github.com/dustinxie/ecc v0.0.0-20210511000915-959544187564
-	github.com/foxxorcat/mopan-sdk-go v0.1.5
+	github.com/foxxorcat/mopan-sdk-go v0.1.6
 	github.com/foxxorcat/weiyun-sdk-go v0.1.3
 	github.com/gaoyb7/115drive-webdav v0.1.8
 	github.com/gin-contrib/cors v1.5.0
@@ -33,9 +34,11 @@ require (
 	github.com/google/uuid v1.5.0
 	github.com/gorilla/websocket v1.5.1
 	github.com/hirochachacha/go-smb2 v1.1.0
+	github.com/ipfs/boxo v0.12.0
 	github.com/ipfs/go-ipfs-api v0.7.0
 	github.com/jlaffaye/ftp v0.2.0
 	github.com/json-iterator/go v1.1.12
+	github.com/larksuite/oapi-sdk-go/v3 v3.2.5
 	github.com/maruel/natural v1.1.1
 	github.com/meilisearch/meilisearch-go v0.26.1
 	github.com/minio/sio v0.3.0
@@ -64,8 +67,8 @@ require (
 	gopkg.in/ldap.v3 v3.1.0
 	gorm.io/driver/mysql v1.4.7
 	gorm.io/driver/postgres v1.4.8
-	gorm.io/driver/sqlite v1.4.4
-	gorm.io/gorm v1.24.5
+	gorm.io/driver/sqlite v1.5.5
+	gorm.io/gorm v1.25.10
 )
 
 require (
@@ -77,6 +80,7 @@ require (
 	github.com/aead/ecdh v0.2.0 // indirect
 	github.com/andreburgaud/crypt2go v1.2.0 // indirect
 	github.com/andybalholm/brotli v1.0.4 // indirect
+	github.com/axgle/mahonia v0.0.0-20180208002826-3358181d7394
 	github.com/aymanbagabas/go-osc52/v2 v2.0.1 // indirect
 	github.com/benbjohnson/clock v1.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -127,8 +131,8 @@ require (
 	github.com/google/go-tpm v0.9.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
+	github.com/hashicorp/go-version v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
-	github.com/ipfs/boxo v0.12.0 // indirect
 	github.com/ipfs/go-cid v0.4.1 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20221227161230-091c0ba34f0a // indirect
@@ -153,7 +157,7 @@ require (
 	github.com/mattn/go-isatty v0.0.19 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.15 // indirect
-	github.com/mattn/go-sqlite3 v1.14.15 // indirect
+	github.com/mattn/go-sqlite3 v1.14.22 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/minio/sha256-simd v1.0.1 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
