@@ -60,6 +60,26 @@ func digestParts(resp *http.Response) map[string]string {
 	return result
 }
 
+func isStaleDigestChallenge(resp *http.Response) bool {
+	for _, header := range resp.Header.Values("WWW-Authenticate") {
+		for _, directive := range strings.Split(header, ",") {
+			directive = strings.TrimSpace(directive)
+			if len(directive) >= len("Digest ") && strings.EqualFold(directive[:len("Digest ")], "Digest ") {
+				directive = strings.TrimSpace(directive[len("Digest "):])
+			}
+			name, value, ok := strings.Cut(directive, "=")
+			if !ok || !strings.EqualFold(strings.TrimSpace(name), "stale") {
+				continue
+			}
+			value = strings.Trim(strings.TrimSpace(value), `"`)
+			if strings.EqualFold(value, "true") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func getMD5(text string) string {
 	hasher := md5.New()
 	hasher.Write([]byte(text))

@@ -13,14 +13,21 @@ import (
 	"syscall"
 	"time"
 
+	ftpserver "github.com/KirCute/ftpserverlib-pasvportmap"
+	"github.com/KirCute/sftpd-alist"
 	"github.com/alist-org/alist/v3/cmd/flags"
 	"github.com/alist-org/alist/v3/internal/bootstrap"
 	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/internal/frp"
+	"github.com/alist-org/alist/v3/internal/fs"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/alist-org/alist/v3/server"
+	mcpserver "github.com/alist-org/alist/v3/server/mcp"
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // ServerCmd represents the server command
@@ -38,17 +45,22 @@ the address is defined in config file`,
 		bootstrap.InitOfflineDownloadTools()
 		bootstrap.LoadStorages()
 		bootstrap.InitTaskManager()
+		bootstrap.InitFRP()
 		if !flags.Debug && !flags.Dev {
 			gin.SetMode(gin.ReleaseMode)
 		}
 		r := gin.New()
 		r.Use(gin.LoggerWithWriter(log.StandardLogger().Out), gin.RecoveryWithWriter(log.StandardLogger().Out))
 		server.Init(r)
+		var httpHandler http.Handler = r
+		if conf.Conf.Scheme.EnableH2c {
+			httpHandler = h2c.NewHandler(r, &http2.Server{})
+		}
 		var httpSrv, httpsSrv, unixSrv *http.Server
 		if conf.Conf.Scheme.HttpPort != -1 {
 			httpBase := fmt.Sprintf("%s:%d", conf.Conf.Scheme.Address, conf.Conf.Scheme.HttpPort)
 			utils.Log.Infof("start HTTP server @ %s", httpBase)
-			httpSrv = &http.Server{Addr: httpBase, Handler: r}
+			httpSrv = &http.Server{Addr: httpBase, Handler: httpHandler}
 			go func() {
 				err := httpSrv.ListenAndServe()
 				if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -69,7 +81,7 @@ the address is defined in config file`,
 		}
 		if conf.Conf.Scheme.UnixFile != "" {
 			utils.Log.Infof("start unix server @ %s", conf.Conf.Scheme.UnixFile)
-			unixSrv = &http.Server{Handler: r}
+			unixSrv = &http.Server{Handler: httpHandler}
 			go func() {
 				listener, err := net.Listen("unix", conf.Conf.Scheme.UnixFile)
 				if err != nil {
@@ -112,6 +124,55 @@ the address is defined in config file`,
 				}
 			}()
 		}
+		var ftpDriver *server.FtpMainDriver
+		var ftpServer *ftpserver.FtpServer
+		if conf.Conf.FTP.Listen != "" && conf.Conf.FTP.Enable {
+			var err error
+			ftpDriver, err = server.NewMainDriver()
+			if err != nil {
+				utils.Log.Fatalf("failed to start ftp driver: %s", err.Error())
+			} else {
+				utils.Log.Infof("start ftp server on %s", conf.Conf.FTP.Listen)
+				go func() {
+					ftpServer = ftpserver.NewFtpServer(ftpDriver)
+					err = ftpServer.ListenAndServe()
+					if err != nil {
+						utils.Log.Fatalf("problem ftp server listening: %s", err.Error())
+					}
+				}()
+			}
+		}
+		var sftpDriver *server.SftpDriver
+		var sftpServer *sftpd.SftpServer
+		if conf.Conf.SFTP.Listen != "" && conf.Conf.SFTP.Enable {
+			var err error
+			sftpDriver, err = server.NewSftpDriver()
+			if err != nil {
+				utils.Log.Fatalf("failed to start sftp driver: %s", err.Error())
+			} else {
+				utils.Log.Infof("start sftp server on %s", conf.Conf.SFTP.Listen)
+				go func() {
+					sftpServer = sftpd.NewSftpServer(sftpDriver)
+					err = sftpServer.RunServer()
+					if err != nil {
+						utils.Log.Fatalf("problem sftp server listening: %s", err.Error())
+					}
+				}()
+			}
+		}
+		var mcpHttpSrv *http.Server
+		if conf.Conf.MCP.Port != -1 && conf.Conf.MCP.Enable {
+			mcpHandler := mcpserver.NewHTTPHandler()
+			mcpBase := fmt.Sprintf("%s:%d", conf.Conf.Scheme.Address, conf.Conf.MCP.Port)
+			utils.Log.Infof("start MCP server @ %s", mcpBase)
+			mcpHttpSrv = &http.Server{Addr: mcpBase, Handler: mcpHandler}
+			go func() {
+				err := mcpHttpSrv.ListenAndServe()
+				if err != nil && !errors.Is(err, http.ErrServerClosed) {
+					utils.Log.Fatalf("failed to start MCP server: %s", err.Error())
+				}
+			}()
+		}
 		// Wait for interrupt signal to gracefully shutdown the server with
 		// a timeout of 1 second.
 		quit := make(chan os.Signal, 1)
@@ -121,6 +182,8 @@ the address is defined in config file`,
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 		<-quit
 		utils.Log.Println("Shutdown server...")
+		fs.ArchiveContentUploadTaskManager.RemoveAll()
+		frp.Instance.Stop()
 		Release()
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 		defer cancel()
@@ -149,6 +212,34 @@ the address is defined in config file`,
 				defer wg.Done()
 				if err := unixSrv.Shutdown(ctx); err != nil {
 					utils.Log.Fatal("Unix server shutdown err: ", err)
+				}
+			}()
+		}
+		if conf.Conf.FTP.Listen != "" && conf.Conf.FTP.Enable && ftpServer != nil && ftpDriver != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				ftpDriver.Stop()
+				if err := ftpServer.Stop(); err != nil {
+					utils.Log.Fatal("FTP server shutdown err: ", err)
+				}
+			}()
+		}
+		if conf.Conf.SFTP.Listen != "" && conf.Conf.SFTP.Enable && sftpServer != nil && sftpDriver != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := sftpServer.Close(); err != nil {
+					utils.Log.Fatal("SFTP server shutdown err: ", err)
+				}
+			}()
+		}
+		if conf.Conf.MCP.Port != -1 && conf.Conf.MCP.Enable && mcpHttpSrv != nil {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := mcpHttpSrv.Shutdown(ctx); err != nil {
+					utils.Log.Fatal("MCP server shutdown err: ", err)
 				}
 			}()
 		}

@@ -14,6 +14,7 @@ import (
 	"github.com/alist-org/alist/v3/internal/fs"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
+	"github.com/alist-org/alist/v3/server/common"
 )
 
 // slashClean is equivalent to but slightly more efficient than
@@ -33,6 +34,14 @@ func moveFiles(ctx context.Context, src, dst string, overwrite bool) (status int
 	dstDir := path.Dir(dst)
 	srcName := path.Base(src)
 	dstName := path.Base(dst)
+	user := ctx.Value("user").(*model.User)
+	perm := common.MergeRolePermissions(user, src)
+	if srcDir != dstDir && !common.HasPermission(perm, common.PermMove) {
+		return http.StatusForbidden, nil
+	}
+	if srcName != dstName && !common.HasPermission(perm, common.PermRename) {
+		return http.StatusForbidden, nil
+	}
 	if srcDir == dstDir {
 		err = fs.Rename(ctx, src, dstName)
 	} else {
@@ -85,6 +94,7 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 		depth = 0
 	}
 	meta, _ := op.GetNearestMeta(name)
+	user := ctx.Value("user").(*model.User)
 	// Read directory names.
 	objs, err := fs.List(context.WithValue(ctx, "meta", meta), name, &fs.ListArgs{})
 	//f, err := fs.OpenFile(ctx, name, os.O_RDONLY, 0)
@@ -99,6 +109,9 @@ func walkFS(ctx context.Context, depth int, name string, info model.Obj, walkFn 
 
 	for _, fileInfo := range objs {
 		filename := path.Join(name, fileInfo.GetName())
+		if !common.CanReadPathByRole(user, filename) {
+			continue
+		}
 		if err != nil {
 			if err := walkFn(filename, fileInfo, err); err != nil && err != filepath.SkipDir {
 				return err

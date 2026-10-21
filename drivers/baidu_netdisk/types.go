@@ -1,11 +1,17 @@
 package baidu_netdisk
 
 import (
+	"errors"
 	"path"
 	"strconv"
 	"time"
 
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/pkg/utils"
+)
+
+var (
+	ErrBaiduEmptyFilesNotAllowed = errors.New("empty files are not allowed by baidu netdisk")
 )
 
 type TokenErrResp struct {
@@ -16,7 +22,7 @@ type TokenErrResp struct {
 type File struct {
 	//TkbindId     int    `json:"tkbind_id"`
 	//OwnerType    int    `json:"owner_type"`
-	//Category     int    `json:"category"`
+	Category int `json:"category"`
 	//RealCategory string `json:"real_category"`
 	FsId int64 `json:"fs_id"`
 	//OperId      int   `json:"oper_id"`
@@ -55,11 +61,11 @@ func fileToObj(f File) *model.ObjThumb {
 	if f.ServerFilename == "" {
 		f.ServerFilename = path.Base(f.Path)
 	}
-	if f.LocalCtime == 0 {
-		f.LocalCtime = f.Ctime
+	if f.ServerCtime == 0 {
+		f.ServerCtime = f.Ctime
 	}
-	if f.LocalMtime == 0 {
-		f.LocalMtime = f.Mtime
+	if f.ServerMtime == 0 {
+		f.ServerMtime = f.Mtime
 	}
 	return &model.ObjThumb{
 		Object: model.Object{
@@ -67,12 +73,12 @@ func fileToObj(f File) *model.ObjThumb {
 			Path:     f.Path,
 			Name:     f.ServerFilename,
 			Size:     f.Size,
-			Modified: time.Unix(f.LocalMtime, 0),
-			Ctime:    time.Unix(f.LocalCtime, 0),
+			Modified: time.Unix(f.ServerMtime, 0),
+			Ctime:    time.Unix(f.ServerCtime, 0),
 			IsFolder: f.Isdir == 1,
 
 			// 直接获取的MD5是错误的
-			// HashInfo: utils.NewHashInfo(utils.MD5, f.Md5),
+			HashInfo: utils.NewHashInfo(utils.MD5, DecryptMd5(f.Md5)),
 		},
 		Thumbnail: model.Thumbnail{Thumbnail: f.Thumbs.Url3},
 	}
@@ -187,4 +193,28 @@ type PrecreateResp struct {
 
 	// return_type=2
 	File File `json:"info"`
+}
+
+type UploadServerResp struct {
+	BakServer  []any `json:"bak_server"`
+	BakServers []struct {
+		Server string `json:"server"`
+	} `json:"bak_servers"`
+	ClientIP    string `json:"client_ip"`
+	ErrorCode   int    `json:"error_code"`
+	ErrorMsg    string `json:"error_msg"`
+	Expire      int    `json:"expire"`
+	Host        string `json:"host"`
+	Newno       string `json:"newno"`
+	QuicServer  []any  `json:"quic_server"`
+	QuicServers []struct {
+		Server string `json:"server"`
+	} `json:"quic_servers"`
+	RequestID  int64 `json:"request_id"`
+	Server     []any `json:"server"`
+	ServerTime int   `json:"server_time"`
+	Servers    []struct {
+		Server string `json:"server"`
+	} `json:"servers"`
+	Sl int `json:"sl"`
 }

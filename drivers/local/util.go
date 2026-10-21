@@ -2,12 +2,17 @@ package local
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/model"
@@ -16,14 +21,18 @@ import (
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 )
 
-func isSymlinkDir(f fs.FileInfo, path string) bool {
-	if f.Mode()&os.ModeSymlink == os.ModeSymlink {
-		dst, err := os.Readlink(filepath.Join(path, f.Name()))
+func isLinkedDir(f fs.FileInfo, path string) bool {
+	if f.Mode()&os.ModeSymlink == os.ModeSymlink || (runtime.GOOS == "windows" && f.Mode()&os.ModeIrregular != 0) {
+		dst, err := os.Readlink(path)
 		if err != nil {
 			return false
 		}
 		if !filepath.IsAbs(dst) {
-			dst = filepath.Join(path, dst)
+			dst = filepath.Join(filepath.Dir(path), dst)
+		}
+		dst, err = filepath.Abs(dst)
+		if err != nil {
+			return false
 		}
 		stat, err := os.Stat(dst)
 		if err != nil {
@@ -34,14 +43,182 @@ func isSymlinkDir(f fs.FileInfo, path string) bool {
 	return false
 }
 
-func GetSnapshot(videoPath string, frameNum int) (imgData *bytes.Buffer, err error) {
-	srcBuf := bytes.NewBuffer(nil)
-	err = ffmpeg.Input(videoPath).Filter("select", ffmpeg.Args{fmt.Sprintf("gte(n,%d)", frameNum)}).
-		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg"}).
-		WithOutput(srcBuf, os.Stdout).
+// sanitizeFilePath validates and sanitizes a file path before passing it to external commands.
+// It ensures the path is absolute, clean, and refers to an existing regular file,
+// preventing path traversal and command injection via shell metacharacters.
+func sanitizeFilePath(path string) (string, error) {
+	cleaned := filepath.Clean(path)
+	if !filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("file path must be absolute: %s", path)
+	}
+	// Reject any control character (including NUL, CR, LF and other
+	// non-printable bytes) instead of relying on a fixed blacklist, since a
+	// blacklist can be bypassed via alternative encodings or characters that
+	// were not anticipated.
+	for _, r := range cleaned {
+		if r == utf8.RuneError || unicode.IsControl(r) {
+			return "", fmt.Errorf("file path contains invalid characters: %s", path)
+		}
+	}
+	if strings.ContainsAny(cleaned, ";&|`$<>!") {
+		return "", fmt.Errorf("file path contains invalid characters: %s", path)
+	}
+	info, err := os.Stat(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("file path is not accessible: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("path is not a regular file: %s", cleaned)
+	}
+	return cleaned, nil
+}
+
+// resizeImageToBufferWithFFmpegGo 使用 ffmpeg-go 调整图片大小并输出到内存缓冲区
+func resizeImageToBufferWithFFmpegGo(inputFile string, width int, outputFormat string /* e.g., "image2pipe", "png_pipe", "mjpeg" */) (*bytes.Buffer, error) {
+	sanitized, err := sanitizeFilePath(inputFile)
+	if err != nil {
+		return nil, fmt.Errorf("invalid input file path: %w", err)
+	}
+	inputFile = sanitized
+
+	outBuffer := bytes.NewBuffer(nil)
+
+	// Determine codec based on desired output format for piping
+	// For generic image piping, 'image2' is often used with -f image2pipe
+	// For specific formats to buffer, you might specify the codec directly
+	var vcodec string
+	switch outputFormat {
+	case "png_pipe": // if you want to ensure PNG format in buffer
+		vcodec = "png"
+	case "mjpeg": // if you want to ensure JPEG format in buffer
+		vcodec = "mjpeg"
+		// default or "image2pipe" could leave codec choice more to ffmpeg or require -c:v later
+	}
+
+	outputArgs := ffmpeg.KwArgs{
+		"vf":      fmt.Sprintf("scale=%d:-1:flags=lanczos,format=yuv444p", width),
+		"vframes": "1",
+		"f":       outputFormat, // Format for piping (e.g., image2pipe, png_pipe)
+	}
+	if vcodec != "" {
+		outputArgs["vcodec"] = vcodec
+	}
+	if outputFormat == "mjpeg" {
+		outputArgs["q:v"] = "3"
+	}
+
+	err = ffmpeg.Input(inputFile).
+		Output("pipe:", outputArgs). // Output to pipe (stdout)
+		GlobalArgs("-loglevel", "error").
+		GlobalArgs("-protocol_whitelist", "file"). // Restrict ffmpeg to the file protocol only
+		Silent(true).                     // Suppress ffmpeg's own console output
+		WithOutput(outBuffer, os.Stderr). // Capture stdout to outBuffer, stderr to os.Stderr
+		// ErrorToStdOut(). // Alternative: send ffmpeg's stderr to Go's stdout
 		Run()
 
 	if err != nil {
+		return nil, fmt.Errorf("ffmpeg-go failed to resize image %s to buffer: %w", inputFile, err)
+	}
+	if outBuffer == nil || outBuffer.Len() == 0 {
+		return nil, fmt.Errorf("ffmpeg-go produced empty buffer for %s", inputFile)
+	}
+
+	return outBuffer, nil
+}
+
+func generateThumbnailWithImagingOptimized(imagePath string, targetWidth int, quality int) (*bytes.Buffer, error) {
+
+	file, err := os.Open(imagePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open image: %w", err)
+	}
+	defer file.Close()
+
+	img, err := imaging.Decode(file, imaging.AutoOrientation(true))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode image: %w", err)
+	}
+
+	thumbImg := imaging.Resize(img, targetWidth, 0, imaging.Lanczos)
+	img = nil
+
+	var buf bytes.Buffer
+	// imaging.Encode
+	// imaging.PNG, imaging.JPEG, imaging.GIF, imaging.BMP, imaging.TIFF
+	outputFormat := imaging.JPEG
+	encodeOptions := []imaging.EncodeOption{imaging.JPEGQuality(quality)}
+
+	// outputFormat := imaging.PNG
+	// encodeOptions := []imaging.EncodeOption{}
+
+	err = imaging.Encode(&buf, thumbImg, outputFormat, encodeOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode thumbnail: %w", err)
+	}
+
+	thumbImg = nil
+
+	return &buf, nil
+}
+
+// Get the snapshot of the video
+func (d *Local) GetSnapshot(videoPath string) (imgData *bytes.Buffer, err error) {
+	sanitized, err := sanitizeFilePath(videoPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid video path: %w", err)
+	}
+	videoPath = sanitized
+
+	// Run ffprobe to get the video duration
+	// Restrict ffprobe to the file protocol only, so a crafted path cannot
+	// make it fetch remote resources or read arbitrary local files via
+	// other protocols (http, concat, subfile, pipe, etc.).
+	jsonOutput, err := ffmpeg.Probe(videoPath, ffmpeg.KwArgs{"protocol_whitelist": "file"})
+	if err != nil {
+		return nil, err
+	}
+	// get format.duration from the json string
+	type probeFormat struct {
+		Duration string `json:"duration"`
+	}
+	type probeData struct {
+		Format probeFormat `json:"format"`
+	}
+	var probe probeData
+	err = json.Unmarshal([]byte(jsonOutput), &probe)
+	if err != nil {
+		return nil, err
+	}
+	totalDuration, err := strconv.ParseFloat(probe.Format.Duration, 64)
+	if err != nil {
+		return nil, err
+	}
+
+	var ss string
+	if d.videoThumbPosIsPercentage {
+		ss = fmt.Sprintf("%f", totalDuration*d.videoThumbPos)
+	} else {
+		// If the value is greater than the total duration, use the total duration
+		if d.videoThumbPos > totalDuration {
+			ss = fmt.Sprintf("%f", totalDuration)
+		} else {
+			ss = fmt.Sprintf("%f", d.videoThumbPos)
+		}
+	}
+
+	// Run ffmpeg to get the snapshot
+	srcBuf := bytes.NewBuffer(nil)
+	// If the remaining time from the seek point to the end of the video is less
+	// than the duration of a single frame, ffmpeg cannot extract any frames
+	// within the specified range and will exit with an error.
+	// The "noaccurate_seek" option prevents this error and would also speed up
+	// the seek process.
+	stream := ffmpeg.Input(videoPath, ffmpeg.KwArgs{"ss": ss, "noaccurate_seek": ""}).
+		Output("pipe:", ffmpeg.KwArgs{"vframes": 1, "format": "image2", "vcodec": "mjpeg", "vf": fmt.Sprintf("scale=%d:-1:flags=lanczos", d.thumbPixel)}).
+		GlobalArgs("-loglevel", "error").
+		GlobalArgs("-protocol_whitelist", "file").Silent(true).
+		WithOutput(srcBuf, os.Stdout)
+	if err = stream.Run(); err != nil {
 		return nil, err
 	}
 	return srcBuf, nil
@@ -64,7 +241,7 @@ func readDir(dirname string) ([]fs.FileInfo, error) {
 func (d *Local) getThumb(file model.Obj) (*bytes.Buffer, *string, error) {
 	fullPath := file.GetPath()
 	thumbPrefix := "alist_thumb_"
-	thumbName := thumbPrefix + utils.GetMD5EncodeStr(fullPath) + ".png"
+	thumbName := thumbPrefix + utils.GetMD5EncodeStr(fmt.Sprintf("%s:%d", fullPath, d.thumbPixel)) + ".png"
 	if d.ThumbCacheFolder != "" {
 		// skip if the file is a thumbnail
 		if strings.HasPrefix(file.GetName(), thumbPrefix) {
@@ -77,35 +254,32 @@ func (d *Local) getThumb(file model.Obj) (*bytes.Buffer, *string, error) {
 	}
 	var srcBuf *bytes.Buffer
 	if utils.GetFileType(file.GetName()) == conf.VIDEO {
-		videoBuf, err := GetSnapshot(fullPath, 10)
+		videoBuf, err := d.GetSnapshot(fullPath)
 		if err != nil {
 			return nil, nil, err
 		}
 		srcBuf = videoBuf
 	} else {
-		imgData, err := os.ReadFile(fullPath)
-		if err != nil {
-			return nil, nil, err
+		if d.useFFmpeg {
+			imgData, err := resizeImageToBufferWithFFmpegGo(fullPath, d.thumbPixel, "image2pipe")
+			srcBuf = imgData
+			if err != nil {
+				return nil, nil, err
+			}
+		} else {
+			imgData, err := generateThumbnailWithImagingOptimized(fullPath, d.thumbPixel, 70)
+			srcBuf = imgData
+			if err != nil {
+				return nil, nil, err
+			}
 		}
-		imgBuf := bytes.NewBuffer(imgData)
-		srcBuf = imgBuf
 	}
 
-	image, err := imaging.Decode(srcBuf, imaging.AutoOrientation(true))
-	if err != nil {
-		return nil, nil, err
-	}
-	thumbImg := imaging.Resize(image, 144, 0, imaging.Lanczos)
-	var buf bytes.Buffer
-	err = imaging.Encode(&buf, thumbImg, imaging.PNG)
-	if err != nil {
-		return nil, nil, err
-	}
 	if d.ThumbCacheFolder != "" {
-		err = os.WriteFile(filepath.Join(d.ThumbCacheFolder, thumbName), buf.Bytes(), 0666)
+		err := os.WriteFile(filepath.Join(d.ThumbCacheFolder, thumbName), srcBuf.Bytes(), 0666)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
-	return &buf, nil, nil
+	return srcBuf, nil, nil
 }

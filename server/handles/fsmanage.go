@@ -1,11 +1,14 @@
 package handles
 
 import (
+	"context"
 	"fmt"
-	"github.com/xhofe/tache"
 	"io"
 	stdpath "path"
 
+	"github.com/alist-org/alist/v3/internal/task"
+
+	"github.com/alist-org/alist/v3/internal/conf"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/fs"
 	"github.com/alist-org/alist/v3/internal/model"
@@ -35,7 +38,12 @@ func FsMkdir(c *gin.Context) {
 		common.ErrorResp(c, err, 403)
 		return
 	}
-	if !user.CanWrite() {
+	if !common.CheckPathLimitWithRoles(user, reqPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	perm := common.MergeRolePermissions(user, reqPath)
+	if !common.HasPermission(perm, common.PermWrite) {
 		meta, err := op.GetNearestMeta(stdpath.Dir(reqPath))
 		if err != nil {
 			if !errors.Is(errors.Cause(err), errs.MetaNotFound) {
@@ -56,9 +64,13 @@ func FsMkdir(c *gin.Context) {
 }
 
 type MoveCopyReq struct {
-	SrcDir string   `json:"src_dir"`
-	DstDir string   `json:"dst_dir"`
-	Names  []string `json:"names"`
+	SrcDir    string   `json:"src_dir"`
+	DstDir    string   `json:"dst_dir"`
+	Names     []string `json:"names"`
+	Overwrite bool     `json:"overwrite"`
+	// SkipExisting only takes effect on copy: existing destination files
+	// with the same size are skipped instead of failing the request
+	SkipExisting bool `json:"skip_existing"`
 }
 
 func FsMove(c *gin.Context) {
@@ -72,13 +84,13 @@ func FsMove(c *gin.Context) {
 		return
 	}
 	user := c.MustGet("user").(*model.User)
-	if !user.CanMove() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
 	srcDir, err := user.JoinPath(req.SrcDir)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
+		return
+	}
+	if !common.CheckPathLimitWithRoles(user, srcDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
 		return
 	}
 	dstDir, err := user.JoinPath(req.DstDir)
@@ -86,8 +98,40 @@ func FsMove(c *gin.Context) {
 		common.ErrorResp(c, err, 403)
 		return
 	}
+	if !common.CheckPathLimitWithRoles(user, dstDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	permMove := common.MergeRolePermissions(user, srcDir)
+	if !common.HasPermission(permMove, common.PermMove) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	if !req.Overwrite {
+		for _, name := range req.Names {
+			dstPath, err := utils.JoinUnderBase(dstDir, name)
+			if err != nil {
+				common.ErrorResp(c, err, 400)
+				return
+			}
+			if res, _ := fs.Get(c, dstPath, &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, fmt.Sprintf("file [%s] exists", name), 403)
+				return
+			}
+		}
+	}
 	for i, name := range req.Names {
-		err := fs.Move(c, stdpath.Join(srcDir, name), dstDir, len(req.Names) > i+1)
+		srcPath, err := utils.JoinUnderBase(srcDir, name)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		_, err = utils.JoinUnderBase(dstDir, name)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		err = fs.Move(c, srcPath, dstDir, len(req.Names) > i+1)
 		if err != nil {
 			common.ErrorResp(c, err, 500)
 			return
@@ -107,13 +151,13 @@ func FsCopy(c *gin.Context) {
 		return
 	}
 	user := c.MustGet("user").(*model.User)
-	if !user.CanCopy() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
 	srcDir, err := user.JoinPath(req.SrcDir)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
+		return
+	}
+	if !common.CheckPathLimitWithRoles(user, srcDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
 		return
 	}
 	dstDir, err := user.JoinPath(req.DstDir)
@@ -121,9 +165,45 @@ func FsCopy(c *gin.Context) {
 		common.ErrorResp(c, err, 403)
 		return
 	}
-	var addedTasks []tache.TaskWithInfo
+	if !common.CheckPathLimitWithRoles(user, dstDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	perm := common.MergeRolePermissions(user, srcDir)
+	if !common.HasPermission(perm, common.PermCopy) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	if !req.Overwrite && !req.SkipExisting {
+		for _, name := range req.Names {
+			dstPath, err := utils.JoinUnderBase(dstDir, name)
+			if err != nil {
+				common.ErrorResp(c, err, 400)
+				return
+			}
+			if res, _ := fs.Get(c, dstPath, &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, fmt.Sprintf("file [%s] exists", name), 403)
+				return
+			}
+		}
+	}
+	var ctx context.Context = c
+	if req.SkipExisting {
+		ctx = context.WithValue(ctx, conf.SkipExistingKey, struct{}{})
+	}
+	var addedTasks []task.TaskExtensionInfo
 	for i, name := range req.Names {
-		t, err := fs.Copy(c, stdpath.Join(srcDir, name), dstDir, len(req.Names) > i+1)
+		srcPath, err := utils.JoinUnderBase(srcDir, name)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		_, err = utils.JoinUnderBase(dstDir, name)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		t, err := fs.Copy(ctx, srcPath, dstDir, len(req.Names) > i+1)
 		if t != nil {
 			addedTasks = append(addedTasks, t)
 		}
@@ -138,8 +218,25 @@ func FsCopy(c *gin.Context) {
 }
 
 type RenameReq struct {
-	Path string `json:"path"`
-	Name string `json:"name"`
+	Path      string `json:"path"`
+	Name      string `json:"name"`
+	Overwrite bool   `json:"overwrite"`
+}
+
+func canRenamePath(c *gin.Context, reqPath string) bool {
+	meta, err := op.GetNearestMeta(reqPath)
+	if err != nil {
+		if !errors.Is(errors.Cause(err), errs.MetaNotFound) {
+			common.ErrorResp(c, err, 500, true)
+			return false
+		}
+		return true
+	}
+	if meta != nil && meta.Password != "" && common.IsApply(meta.Path, reqPath, meta.PSub) {
+		common.ErrorStrResp(c, "Path is password-protected and cannot be renamed.", 403)
+		return false
+	}
+	return true
 }
 
 func FsRename(c *gin.Context) {
@@ -149,14 +246,39 @@ func FsRename(c *gin.Context) {
 		return
 	}
 	user := c.MustGet("user").(*model.User)
-	if !user.CanRename() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
 	reqPath, err := user.JoinPath(req.Path)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
 		return
+	}
+	if !common.CheckPathLimitWithRoles(user, reqPath) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	if !canRenamePath(c, reqPath) {
+		return
+	}
+	perm := common.MergeRolePermissions(user, reqPath)
+	if !common.HasPermission(perm, common.PermRename) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	if err := utils.ValidateNameComponent(req.Name); err != nil {
+		common.ErrorResp(c, err, 400)
+		return
+	}
+	if !req.Overwrite {
+		dstPath, err := utils.JoinUnderBase(stdpath.Dir(reqPath), req.Name)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		if dstPath != reqPath {
+			if res, _ := fs.Get(c, dstPath, &fs.GetArgs{NoLog: true}); res != nil {
+				common.ErrorStrResp(c, fmt.Sprintf("file [%s] exists", req.Name), 403)
+				return
+			}
+		}
 	}
 	if err := fs.Rename(c, reqPath, req.Name); err != nil {
 		common.ErrorResp(c, err, 500)
@@ -181,17 +303,27 @@ func FsRemove(c *gin.Context) {
 		return
 	}
 	user := c.MustGet("user").(*model.User)
-	if !user.CanRemove() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
 	reqDir, err := user.JoinPath(req.Dir)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
 		return
 	}
+	if !common.CheckPathLimitWithRoles(user, reqDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	perm := common.MergeRolePermissions(user, reqDir)
+	if !common.HasPermission(perm, common.PermRemove) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
 	for _, name := range req.Names {
-		err := fs.Remove(c, stdpath.Join(reqDir, name))
+		removePath, err := utils.JoinUnderBase(reqDir, name)
+		if err != nil {
+			common.ErrorResp(c, err, 400)
+			return
+		}
+		err = fs.Remove(c, removePath)
 		if err != nil {
 			common.ErrorResp(c, err, 500)
 			return
@@ -213,13 +345,18 @@ func FsRemoveEmptyDirectory(c *gin.Context) {
 	}
 
 	user := c.MustGet("user").(*model.User)
-	if !user.CanRemove() {
-		common.ErrorResp(c, errs.PermissionDenied, 403)
-		return
-	}
 	srcDir, err := user.JoinPath(req.SrcDir)
 	if err != nil {
 		common.ErrorResp(c, err, 403)
+		return
+	}
+	if !common.CheckPathLimitWithRoles(user, srcDir) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
+		return
+	}
+	perm := common.MergeRolePermissions(user, srcDir)
+	if !common.HasPermission(perm, common.PermRemove) {
+		common.ErrorResp(c, errs.PermissionDenied, 403)
 		return
 	}
 

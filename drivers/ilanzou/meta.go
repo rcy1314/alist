@@ -9,6 +9,7 @@ type Addition struct {
 	driver.RootID
 	Username string `json:"username" type:"string" required:"true"`
 	Password string `json:"password" type:"string" required:"true"`
+	Ip       string `json:"ip" type:"string"`
 
 	Token string
 	UUID  string
@@ -46,7 +47,7 @@ func init() {
 				bucket:     "wpanstore-lanzou",
 				unproved:   "unproved",
 				proved:     "proved",
-				devVersion: "122",
+				devVersion: "125",
 				site:       "https://www.ilanzou.com",
 			},
 		}
@@ -72,7 +73,7 @@ func init() {
 				bucket:     "wpanstore",
 				unproved:   "ws",
 				proved:     "app",
-				devVersion: "121",
+				devVersion: "125",
 				site:       "https://www.feijipan.com",
 			},
 		}

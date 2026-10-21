@@ -6,6 +6,7 @@ import (
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
+	"github.com/alist-org/alist/v3/server/common"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 )
@@ -23,8 +24,10 @@ func list(ctx context.Context, path string, args *ListArgs) ([]model.Obj, error)
 	var _objs []model.Obj
 	if storage != nil {
 		_objs, err = op.List(ctx, storage, actualPath, model.ListArgs{
-			ReqPath: path,
-		}, args.Refresh)
+			ReqPath:       path,
+			Refresh:       args.Refresh,
+			NoUpdateIndex: args.NoUpdateIndex,
+		})
 		if err != nil {
 			if !args.NoLog {
 				log.Errorf("fs/list: %+v", err)
@@ -44,8 +47,13 @@ func list(ctx context.Context, path string, args *ListArgs) ([]model.Obj, error)
 }
 
 func whetherHide(user *model.User, meta *model.Meta, path string) bool {
-	// if is admin, don't hide
-	if user == nil || user.CanSeeHides() {
+	// if user is nil, don't hide
+	if user == nil {
+		return false
+	}
+	perm := common.MergeRolePermissions(user, path)
+	// if user has see-hides permission, don't hide
+	if common.HasPermission(perm, common.PermSeeHides) {
 		return false
 	}
 	// if meta is nil, don't hide

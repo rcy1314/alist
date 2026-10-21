@@ -13,13 +13,21 @@ import (
 type ListArgs struct {
 	ReqPath           string
 	S3ShowPlaceholder bool
+	Refresh           bool
+	// NoUpdateIndex skips the objs-update hook (used to auto-build the search
+	// index) for this listing. Wrapper drivers (alias, crypt, strm, chunker)
+	// set it when listing their underlying storage so the real path is not
+	// auto-indexed alongside the wrapper's own mount path, which would create
+	// duplicate search entries.
+	NoUpdateIndex bool
 }
 
 type LinkArgs struct {
-	IP      string
-	Header  http.Header
-	Type    string
-	HttpReq *http.Request
+	IP       string
+	Header   http.Header
+	Type     string
+	HttpReq  *http.Request
+	Redirect bool
 }
 
 type Link struct {
@@ -47,6 +55,33 @@ type FsOtherArgs struct {
 	Method string      `json:"method" form:"method"`
 	Data   interface{} `json:"data" form:"data"`
 }
+
+type ArchiveArgs struct {
+	Password string
+	LinkArgs
+}
+
+type ArchiveInnerArgs struct {
+	ArchiveArgs
+	InnerPath string
+}
+
+type ArchiveMetaArgs struct {
+	ArchiveArgs
+	Refresh bool
+}
+
+type ArchiveListArgs struct {
+	ArchiveInnerArgs
+	Refresh bool
+}
+
+type ArchiveDecompressArgs struct {
+	ArchiveInnerArgs
+	CacheFull     bool
+	PutIntoNewDir bool
+}
+
 type RangeReadCloserIF interface {
 	RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error)
 	utils.ClosersIF
@@ -59,7 +94,7 @@ type RangeReadCloser struct {
 	utils.Closers
 }
 
-func (r RangeReadCloser) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
+func (r *RangeReadCloser) RangeRead(ctx context.Context, httpRange http_range.Range) (io.ReadCloser, error) {
 	rc, err := r.RangeReader(ctx, httpRange)
 	r.Closers.Add(rc)
 	return rc, err

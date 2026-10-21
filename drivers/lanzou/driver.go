@@ -3,6 +3,7 @@ package lanzou
 import (
 	"context"
 	"net/http"
+	"sync"
 
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/driver"
@@ -19,6 +20,9 @@ type LanZou struct {
 	vei string
 
 	flag int32
+
+	clientOnce sync.Once
+	client     *resty.Client
 }
 
 func (d *LanZou) Config() driver.Config {
@@ -30,6 +34,9 @@ func (d *LanZou) GetAddition() driver.Additional {
 }
 
 func (d *LanZou) Init(ctx context.Context) (err error) {
+	if d.UserAgent == "" {
+		d.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.39 (KHTML, like Gecko) Chrome/89.0.4389.111 Safari/537.39"
+	}
 	switch d.Type {
 	case "account":
 		_, err := d.Login()
@@ -205,18 +212,22 @@ func (d *LanZou) Remove(ctx context.Context, obj model.Obj) error {
 	return errs.NotSupport
 }
 
-func (d *LanZou) Put(ctx context.Context, dstDir model.Obj, stream model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
+func (d *LanZou) Put(ctx context.Context, dstDir model.Obj, s model.FileStreamer, up driver.UpdateProgress) (model.Obj, error) {
 	if d.IsCookie() || d.IsAccount() {
 		var resp RespText[[]FileOrFolder]
 		_, err := d._post(d.BaseUrl+"/html5up.php", func(req *resty.Request) {
+			reader := driver.NewLimitedUploadStream(ctx, &driver.ReaderUpdatingProgress{
+				Reader:         s,
+				UpdateProgress: up,
+			})
 			req.SetFormData(map[string]string{
 				"task":           "1",
 				"vie":            "2",
 				"ve":             "2",
 				"id":             "WU_FILE_0",
-				"name":           stream.GetName(),
+				"name":           s.GetName(),
 				"folder_id_bb_n": dstDir.GetID(),
-			}).SetFileReader("upload_file", stream.GetName(), stream).SetContext(ctx)
+			}).SetFileReader("upload_file", s.GetName(), reader).SetContext(ctx)
 		}, &resp, true)
 		if err != nil {
 			return nil, err

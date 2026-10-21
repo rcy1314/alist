@@ -1,15 +1,15 @@
 package smb
 
 import (
-	"github.com/alist-org/alist/v3/pkg/utils"
+	"context"
 	"io/fs"
-	"net"
 	"os"
 	"path/filepath"
 	"sync/atomic"
 	"time"
 
-	"github.com/hirochachacha/go-smb2"
+	"github.com/alist-org/alist/v3/pkg/utils"
+	"github.com/cloudsoda/go-smb2"
 )
 
 func (d *SMB) updateLastConnTime() {
@@ -24,18 +24,14 @@ func (d *SMB) getLastConnTime() time.Time {
 	return time.Unix(atomic.LoadInt64(&d.lastConnTime), 0)
 }
 
-func (d *SMB) initFS() error {
-	conn, err := net.Dial("tcp", d.Address)
-	if err != nil {
-		return err
-	}
+func (d *SMB) initFS(ctx context.Context) error {
 	dialer := &smb2.Dialer{
 		Initiator: &smb2.NTLMInitiator{
 			User:     d.Username,
 			Password: d.Password,
 		},
 	}
-	s, err := dialer.Dial(conn)
+	s, err := dialer.Dial(ctx, d.Address)
 	if err != nil {
 		return err
 	}
@@ -47,14 +43,14 @@ func (d *SMB) initFS() error {
 	return err
 }
 
-func (d *SMB) checkConn() error {
+func (d *SMB) checkConn(ctx context.Context) error {
 	if time.Since(d.getLastConnTime()) < 5*time.Minute {
 		return nil
 	}
 	if d.fs != nil {
 		_ = d.fs.Umount()
 	}
-	return d.initFS()
+	return d.initFS(ctx)
 }
 
 // CopyFile File copies a single file from src to dst

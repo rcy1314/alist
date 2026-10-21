@@ -10,6 +10,10 @@ import (
 )
 
 func (c *Client) req(method, path string, body io.Reader, intercept func(*http.Request)) (req *http.Response, err error) {
+	return c.reqWithDigestRetry(method, path, body, intercept, true)
+}
+
+func (c *Client) reqWithDigestRetry(method, path string, body io.Reader, intercept func(*http.Request), allowStaleRetry bool) (req *http.Response, err error) {
 	var r *http.Request
 	var retryBuf io.Reader
 	canRetry := true
@@ -86,8 +90,19 @@ func (c *Client) req(method, path string, body io.Reader, intercept func(*http.R
 		// retryBuf will be nil if body was nil initially so no check
 		// for body == nil is required here.
 		if canRetry {
-			return c.req(method, path, retryBuf, intercept)
+			_ = rs.Body.Close()
+			return c.reqWithDigestRetry(method, path, retryBuf, intercept, allowStaleRetry)
 		}
+	} else if rs.StatusCode == 401 && auth.Type() == "DigestAuth" && allowStaleRetry && isStaleDigestChallenge(rs) {
+		c.authMutex.Lock()
+		c.auth = &DigestAuth{auth.User(), auth.Pass(), digestParts(rs)}
+		c.authMutex.Unlock()
+
+		if canRetry {
+			_ = rs.Body.Close()
+			return c.reqWithDigestRetry(method, path, retryBuf, intercept, false)
+		}
+		return rs, newPathError("Authorize", c.root, rs.StatusCode)
 	} else if rs.StatusCode == 401 {
 		return rs, newPathError("Authorize", c.root, rs.StatusCode)
 	}

@@ -8,8 +8,15 @@ import (
 type Addition struct {
 	Cookie string `json:"cookie" required:"true"`
 	driver.RootID
-	OrderBy        string `json:"order_by" type:"select" options:"none,file_type,file_name,updated_at" default:"none"`
-	OrderDirection string `json:"order_direction" type:"select" options:"asc,desc" default:"asc"`
+	OrderBy               string `json:"order_by" type:"select" options:"none,file_type,file_name,updated_at" default:"none"`
+	OrderDirection        string `json:"order_direction" type:"select" options:"asc,desc" default:"asc"`
+	UseTransCodingAddress bool   `json:"use_transcoding_address" help:"You can watch the transcoded video and support 302 redirection" required:"true" default:"false"`
+	OnlyListVideoFile     bool   `json:"only_list_video_file" default:"false"`
+	DownConcurrency       int    `json:"down_concurrency" type:"number" default:"3" help:"concurrency of ranged download, 0 to disable ranged download"`
+	DownPartSize          int    `json:"down_part_size" type:"number" default:"10" help:"part size (MB) of ranged download"`
+	AdditionVersion       int
+	// UTDID is generated once for UC and persisted with the storage.
+	UTDID string
 }
 
 type Conf struct {
@@ -24,7 +31,6 @@ func init() {
 		return &QuarkOrUC{
 			config: driver.Config{
 				Name:              "Quark",
-				OnlyLocal:         true,
 				DefaultRoot:       "0",
 				NoOverwriteUpload: true,
 			},
@@ -40,7 +46,7 @@ func init() {
 		return &QuarkOrUC{
 			config: driver.Config{
 				Name:              "UC",
-				OnlyLocal:         true,
+				OnlyProxy:         true,
 				DefaultRoot:       "0",
 				NoOverwriteUpload: true,
 			},

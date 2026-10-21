@@ -9,6 +9,7 @@ import (
 	"github.com/alist-org/alist/v3/cmd/flags"
 	"github.com/alist-org/alist/v3/drivers/base"
 	"github.com/alist-org/alist/v3/internal/conf"
+	"github.com/alist-org/alist/v3/internal/net"
 	"github.com/alist-org/alist/v3/pkg/utils"
 	"github.com/caarlos0/env/v9"
 	log "github.com/sirupsen/logrus"
@@ -34,6 +35,8 @@ func InitConfig() {
 			log.Fatalf("failed to create config file: %+v", err)
 		}
 		conf.Conf = conf.DefaultConfig()
+		LastLaunchedVersion = conf.Version
+		conf.Conf.LastLaunchedVersion = conf.Version
 		if !utils.WriteJsonToFile(configPath, conf.Conf) {
 			log.Fatalf("failed to create default config file")
 		}
@@ -47,6 +50,7 @@ func InitConfig() {
 		if err != nil {
 			log.Fatalf("load config error: %+v", err)
 		}
+		LastLaunchedVersion = conf.Conf.LastLaunchedVersion
 		// update config.json struct
 		confBody, err := utils.Json.MarshalIndent(conf.Conf, "", "  ")
 		if err != nil {
@@ -57,8 +61,20 @@ func InitConfig() {
 			log.Fatalf("update config struct error: %+v", err)
 		}
 	}
+	if conf.Conf.MaxConcurrency > 0 {
+		net.DefaultConcurrencyLimit = &net.ConcurrencyLimit{Limit: conf.Conf.MaxConcurrency}
+	}
 	if !conf.Conf.Force {
 		confFromEnv()
+	}
+	if conf.Conf.TlsInsecureSkipVerify {
+		log.Warn("SECURITY WARNING / 安全警告:")
+		log.Warn("TLS certificate verification is disabled.")
+		log.Warn("TLS 证书校验已被禁用。")
+		log.Warn("This exposes all storage traffic to MitM attacks and may leak credentials or allow data tampering.")
+		log.Warn("这会使所有存储通信暴露于中间人攻击（MitM），可能导致凭据泄露和数据被篡改。")
+		log.Warn("Only use this setting if you fully understand the risks.")
+		log.Warn("仅在你完全理解风险的情况下使用该配置。")
 	}
 	// convert abs path
 	if !filepath.IsAbs(conf.Conf.TempDir) {
@@ -68,11 +84,7 @@ func InitConfig() {
 		}
 		conf.Conf.TempDir = absPath
 	}
-	err := os.RemoveAll(filepath.Join(conf.Conf.TempDir))
-	if err != nil {
-		log.Errorln("failed delete temp file:", err)
-	}
-	err = os.MkdirAll(conf.Conf.TempDir, 0o777)
+	err := os.MkdirAll(conf.Conf.TempDir, 0o777)
 	if err != nil {
 		log.Fatalf("create temp dir error: %+v", err)
 	}
@@ -103,4 +115,16 @@ func initURL() {
 		utils.Log.Fatalf("can't parse site_url: %+v", err)
 	}
 	conf.URL = u
+}
+
+func CleanTempDir() {
+	files, err := os.ReadDir(conf.Conf.TempDir)
+	if err != nil {
+		log.Errorln("failed list temp file: ", err)
+	}
+	for _, file := range files {
+		if err := os.RemoveAll(filepath.Join(conf.Conf.TempDir, file.Name())); err != nil {
+			log.Errorln("failed delete temp file: ", err)
+		}
+	}
 }

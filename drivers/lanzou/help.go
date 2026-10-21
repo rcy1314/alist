@@ -1,7 +1,6 @@
 package lanzou
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -78,6 +77,46 @@ func RemoveNotes(html string) string {
 	})
 }
 
+// 清理JS注释
+func RemoveJSComment(data string) string {
+	var result strings.Builder
+	inComment := false
+	inSingleLineComment := false
+
+	for i := 0; i < len(data); i++ {
+		v := data[i]
+
+		if inSingleLineComment && (v == '\n' || v == '\r') {
+			inSingleLineComment = false
+			result.WriteByte(v)
+			continue
+		}
+		if inComment && v == '*' && i+1 < len(data) && data[i+1] == '/' {
+			inComment = false
+			i++
+			continue
+		}
+		if v == '/' && i+1 < len(data) {
+			nextChar := data[i+1]
+			if nextChar == '*' {
+				inComment = true
+				i++
+				continue
+			} else if nextChar == '/' {
+				inSingleLineComment = true
+				i++
+				continue
+			}
+		}
+		if inComment || inSingleLineComment {
+			continue
+		}
+		result.WriteByte(v)
+	}
+
+	return result.String()
+}
+
 var findAcwScV2Reg = regexp.MustCompile(`arg1='([0-9A-Z]+)'`)
 
 // 在页面被过多访问或其他情况下，有时候会先返回一个加密的页面，其执行计算出一个acw_sc__v2后放入页面后再重新访问页面才能获得正常页面
@@ -104,11 +143,13 @@ func Unbox(hex string) string {
 }
 
 func HexXor(hex1, hex2 string) string {
-	out := bytes.NewBuffer(make([]byte, len(hex1)))
-	for i := 0; i < len(hex1) && i < len(hex2); i += 2 {
+	var out strings.Builder
+	out.Grow(len(hex1))
+	for i := 0; i+2 <= len(hex1) && i+2 <= len(hex2); i += 2 {
 		v1, _ := strconv.ParseInt(hex1[i:i+2], 16, 64)
 		v2, _ := strconv.ParseInt(hex2[i:i+2], 16, 64)
-		out.WriteString(strconv.FormatInt(v1^v2, 16))
+		// 必须补足前导 0,否则异或结果 < 0x10 时只输出一个字符,导致整个 hex 串错位
+		fmt.Fprintf(&out, "%02x", v1^v2)
 	}
 	return out.String()
 }
@@ -118,23 +159,24 @@ var findKVReg = regexp.MustCompile(`'(.+?)':('?([^' },]*)'?)`) // 拆分kv
 
 // 根据key查询js变量
 func findJSVarFunc(key, data string) string {
-	var values []string
-	if key != "sasign" {
-		values = regexp.MustCompile(`var ` + key + ` = '(.+?)';`).FindStringSubmatch(data)
-	} else {
-		matches := regexp.MustCompile(`var `+key+` = '(.+?)';`).FindAllStringSubmatch(data, -1)
-		if len(matches) == 3 {
-			values = matches[1]
-		} else {
-			if len(matches) > 0 {
-				values = matches[0]
+	matches := regexp.MustCompile(`var\s+`+regexp.QuoteMeta(key)+`\s*=\s*(?:'([^']*)'|"([^"]*)"|([^;\s]+))\s*;`).FindAllStringSubmatch(data, -1)
+	value := func(match []string) string {
+		for _, candidate := range match[1:] {
+			if candidate != "" {
+				return candidate
 			}
 		}
-	}
-	if len(values) == 0 {
 		return ""
 	}
-	return values[1]
+	if key == "sasign" && len(matches) == 3 {
+		return value(matches[1])
+	}
+	for i := len(matches) - 1; i >= 0; i-- {
+		if v := value(matches[i]); v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 var findFunction = regexp.MustCompile(`(?ims)^function[^{]+`)

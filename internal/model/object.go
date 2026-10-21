@@ -11,15 +11,31 @@ type ObjWrapName struct {
 	Obj
 }
 
+type ObjWrapStorageClass struct {
+	storageClass string
+	Obj
+}
+
 func (o *ObjWrapName) Unwrap() Obj {
 	return o.Obj
 }
 
 func (o *ObjWrapName) GetName() string {
-	if o.Name == "" {
-		o.Name = utils.MappingName(o.Obj.GetName())
-	}
 	return o.Name
+}
+
+func (o *ObjWrapStorageClass) Unwrap() Obj {
+	return o.Obj
+}
+
+func (o *ObjWrapStorageClass) StorageClass() string {
+	return o.storageClass
+}
+
+func (o *ObjWrapStorageClass) SetPath(path string) {
+	if setter, ok := o.Obj.(SetPath); ok {
+		setter.SetPath(path)
+	}
 }
 
 type Object struct {

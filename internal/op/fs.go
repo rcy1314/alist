@@ -3,12 +3,15 @@ package op
 import (
 	"context"
 	stdpath "path"
+	"slices"
+	"strconv"
 	"time"
 
 	"github.com/Xhofe/go-cache"
 	"github.com/alist-org/alist/v3/internal/driver"
 	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
+	"github.com/alist-org/alist/v3/internal/stream"
 	"github.com/alist-org/alist/v3/pkg/generic_sync"
 	"github.com/alist-org/alist/v3/pkg/singleflight"
 	"github.com/alist-org/alist/v3/pkg/utils"
@@ -21,10 +24,72 @@ import (
 var listCache = cache.NewMemCache(cache.WithShards[[]model.Obj](64))
 var listG singleflight.Group[[]model.Obj]
 
+const recentWriteConsistencyWindow = time.Minute
+
+// recentWriteCache bridges a short write-after-read consistency window for
+// drivers that return an authoritative object from PutResult. Entries are bound
+// to the stable identity of the parent directory, not its path, so a stale
+// child cannot be rebound to a newly-created same-name directory after the
+// original parent is moved, renamed, or removed.
+var recentWriteCache = cache.NewMemCache(cache.WithShards[model.Obj](64))
+
+func recentWriteIdentityKey(storage *model.Storage, parentID, name string) (string, bool) {
+	if storage == nil || parentID == "" || name == "" {
+		return "", false
+	}
+	// Storage ID plus MountPath isolates both concurrent mounts and a newly
+	// created storage that reuses a recently removed mount path. NUL cannot
+	// occur in provider object names or IDs, so it is an unambiguous separator.
+	return strconv.FormatUint(uint64(storage.ID), 10) + "\x00" + storage.MountPath + "\x00" + parentID + "\x00" + name, true
+}
+
+func recentWriteKey(storage driver.Driver, parent model.Obj, name string) (string, bool) {
+	if parent == nil {
+		return "", false
+	}
+	return recentWriteIdentityKey(storage.GetStorage(), parent.GetID(), name)
+}
+
+func setRecentWrite(storage driver.Driver, parent model.Obj, obj model.Obj) {
+	if obj == nil || obj.GetID() == "" {
+		return
+	}
+	key, ok := recentWriteKey(storage, parent, obj.GetName())
+	if !ok {
+		return
+	}
+	recentWriteCache.Set(key, obj, cache.WithEx[model.Obj](recentWriteConsistencyWindow))
+}
+
+func delRecentWrite(storage driver.Driver, parent model.Obj, name string) {
+	key, ok := recentWriteKey(storage, parent, name)
+	if ok {
+		recentWriteCache.Del(key)
+	}
+}
+
+func getRecentWrite(ctx context.Context, storage driver.Driver, dirPath, name string) (model.Obj, bool) {
+	parent, err := GetUnwrap(ctx, storage, dirPath)
+	if err != nil {
+		return nil, false
+	}
+	key, ok := recentWriteKey(storage, parent, name)
+	if !ok {
+		return nil, false
+	}
+	return recentWriteCache.Get(key)
+}
+
 func updateCacheObj(storage driver.Driver, path string, oldObj model.Obj, newObj model.Obj) {
 	key := Key(storage, path)
 	objs, ok := listCache.Get(key)
 	if ok {
+		for i, obj := range objs {
+			if obj.GetName() == newObj.GetName() {
+				objs = slices.Delete(objs, i, i+1)
+				break
+			}
+		}
 		for i, obj := range objs {
 			if obj.GetName() == oldObj.GetName() {
 				objs[i] = newObj
@@ -100,14 +165,14 @@ func Key(storage driver.Driver, path string) string {
 }
 
 // List files in storage, not contains virtual file
-func List(ctx context.Context, storage driver.Driver, path string, args model.ListArgs, refresh ...bool) ([]model.Obj, error) {
+func List(ctx context.Context, storage driver.Driver, path string, args model.ListArgs) ([]model.Obj, error) {
 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
 		return nil, errors.Errorf("storage not init: %s", storage.GetStorage().Status)
 	}
 	path = utils.FixAndCleanPath(path)
 	log.Debugf("op.List %s", path)
 	key := Key(storage, path)
-	if !utils.IsBool(refresh...) {
+	if !args.Refresh {
 		if files, ok := listCache.Get(key); ok {
 			log.Debugf("use cache when list %s", path)
 			return files, nil
@@ -135,11 +200,11 @@ func List(ctx context.Context, storage driver.Driver, path string, args model.Li
 		// warp obj name
 		model.WrapObjsName(files)
 		// call hooks
-		go func(reqPath string, files []model.Obj) {
-			for _, hook := range objsUpdateHooks {
-				hook(reqPath, files)
-			}
-		}(utils.GetFullPath(storage.GetStorage().MountPath, path), files)
+		if !args.NoUpdateIndex {
+			go func(reqPath string, files []model.Obj) {
+				HandleObjsUpdateHook(reqPath, files)
+			}(utils.GetFullPath(storage.GetStorage().MountPath, path), files)
+		}
 
 		// sort objs
 		if storage.Config().LocalSort {
@@ -225,6 +290,10 @@ func Get(ctx context.Context, storage driver.Driver, path string) (model.Obj, er
 			return f, nil
 		}
 	}
+	if obj, ok := getRecentWrite(ctx, storage, dir, name); ok {
+		log.Debugf("use recent write when get %s", path)
+		return obj, nil
+	}
 	log.Debugf("cant find obj with name: %s", name)
 	return nil, errors.WithStack(errs.ObjectNotFound)
 }
@@ -269,6 +338,12 @@ func Link(ctx context.Context, storage driver.Driver, path string, args model.Li
 		}
 		return link, nil
 	}
+
+	if storage.Config().OnlyLocal {
+		link, err := fn()
+		return link, file, err
+	}
+
 	link, err, _ := linkG.Do(key, fn)
 	return link, file, err
 }
@@ -358,20 +433,31 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		return errors.WithMessage(err, "failed to get src object")
 	}
 	srcObj := model.UnwrapObj(srcRawObj)
+	srcDirPath := stdpath.Dir(srcPath)
+	srcDir, _ := GetUnwrap(ctx, storage, srcDirPath)
+	// Move shared Copy's prologue and fetched dstDir without ensuring it
+	// exists first, so moving within the same storage into a not-yet-created
+	// nested path failed even though the cross-storage move path goes through
+	// Put, which does create it. MakeDir is a no-op when the dir already exists.
+	err = MakeDir(ctx, storage, dstDirPath)
+	if err != nil {
+		return errors.WithMessagef(err, "failed to make dir [%s]", dstDirPath)
+	}
 	dstDir, err := GetUnwrap(ctx, storage, dstDirPath)
 	if err != nil {
 		return errors.WithMessage(err, "failed to get dst dir")
 	}
-	srcDirPath := stdpath.Dir(srcPath)
-
 	switch s := storage.(type) {
 	case driver.MoveResult:
 		var newObj model.Obj
 		newObj, err = s.Move(ctx, srcObj, dstDir)
 		if err == nil {
 			delCacheObj(storage, srcDirPath, srcRawObj)
+			delRecentWrite(storage, srcDir, srcRawObj.GetName())
 			if newObj != nil {
-				addCacheObj(storage, dstDirPath, model.WrapObjName(newObj))
+				wrapped := model.WrapObjName(newObj)
+				addCacheObj(storage, dstDirPath, wrapped)
+				setRecentWrite(storage, dstDir, wrapped)
 			} else if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, dstDirPath)
 			}
@@ -380,6 +466,7 @@ func Move(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 		err = s.Move(ctx, srcObj, dstDir)
 		if err == nil {
 			delCacheObj(storage, srcDirPath, srcRawObj)
+			delRecentWrite(storage, srcDir, srcRawObj.GetName())
 			if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, dstDirPath)
 			}
@@ -401,22 +488,29 @@ func Rename(ctx context.Context, storage driver.Driver, srcPath, dstName string,
 	}
 	srcObj := model.UnwrapObj(srcRawObj)
 	srcDirPath := stdpath.Dir(srcPath)
+	srcDir, _ := GetUnwrap(ctx, storage, srcDirPath)
 
 	switch s := storage.(type) {
 	case driver.RenameResult:
 		var newObj model.Obj
 		newObj, err = s.Rename(ctx, srcObj, dstName)
 		if err == nil {
+			delRecentWrite(storage, srcDir, srcRawObj.GetName())
 			if newObj != nil {
-				updateCacheObj(storage, srcDirPath, srcRawObj, model.WrapObjName(newObj))
+				wrapped := model.WrapObjName(newObj)
+				updateCacheObj(storage, srcDirPath, srcRawObj, wrapped)
+				setRecentWrite(storage, srcDir, wrapped)
 			} else if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, srcDirPath)
 			}
 		}
 	case driver.Rename:
 		err = s.Rename(ctx, srcObj, dstName)
-		if err == nil && !utils.IsBool(lazyCache...) {
-			ClearCache(storage, srcDirPath)
+		if err == nil {
+			delRecentWrite(storage, srcDir, srcRawObj.GetName())
+			if !utils.IsBool(lazyCache...) {
+				ClearCache(storage, srcDirPath)
+			}
 		}
 	default:
 		return errs.NotImplement
@@ -434,6 +528,15 @@ func Copy(ctx context.Context, storage driver.Driver, srcPath, dstDirPath string
 	srcObj, err := GetUnwrap(ctx, storage, srcPath)
 	if err != nil {
 		return errors.WithMessage(err, "failed to get src object")
+	}
+	// Unlike Put, Copy previously fetched dstDir without ensuring it exists
+	// first, so copying into a not-yet-created nested path failed on
+	// same-storage drivers even though the cross-storage fallback (which
+	// goes through Put) succeeded by creating it. MakeDir is a no-op when
+	// the directory already exists.
+	err = MakeDir(ctx, storage, dstDirPath)
+	if err != nil {
+		return errors.WithMessagef(err, "failed to make dir [%s]", dstDirPath)
 	}
 	dstDir, err := GetUnwrap(ctx, storage, dstDirPath)
 	if err != nil {
@@ -466,6 +569,9 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
 		return errors.Errorf("storage not init: %s", storage.GetStorage().Status)
 	}
+	if utils.PathEqual(path, "/") {
+		return errors.New("delete root folder is not allowed, please goto the manage page to delete the storage instead")
+	}
 	path = utils.FixAndCleanPath(path)
 	rawObj, err := Get(ctx, storage, path)
 	if err != nil {
@@ -477,12 +583,14 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 		return errors.WithMessage(err, "failed to get object")
 	}
 	dirPath := stdpath.Dir(path)
+	parentDir, _ := GetUnwrap(ctx, storage, dirPath)
 
 	switch s := storage.(type) {
 	case driver.Remove:
 		err = s.Remove(ctx, model.UnwrapObj(rawObj))
 		if err == nil {
 			delCacheObj(storage, dirPath, rawObj)
+			delRecentWrite(storage, parentDir, rawObj.GetName())
 			// clear folder cache recursively
 			if rawObj.IsDir() {
 				ClearCache(storage, path)
@@ -503,6 +611,12 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 			log.Errorf("failed to close file streamer, %v", err)
 		}
 	}()
+	// UrlTree PUT
+	if storage.GetStorage().Driver == "UrlTree" {
+		var link string
+		dstDirPath, link = urlTreeSplitLineFormPath(stdpath.Join(dstDirPath, file.GetName()))
+		file = &stream.FileStream{Obj: &model.Object{Name: link}}
+	}
 	// if file exist and size = 0, delete it
 	dstDirPath = utils.FixAndCleanPath(dstDirPath)
 	dstPath := stdpath.Join(dstDirPath, file.GetName())
@@ -545,7 +659,9 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		newObj, err = s.Put(ctx, parentDir, file, up)
 		if err == nil {
 			if newObj != nil {
-				addCacheObj(storage, dstDirPath, model.WrapObjName(newObj))
+				wrapped := model.WrapObjName(newObj)
+				addCacheObj(storage, dstDirPath, wrapped)
+				setRecentWrite(storage, parentDir, wrapped)
 			} else if !utils.IsBool(lazyCache...) {
 				ClearCache(storage, dstDirPath)
 			}
@@ -577,5 +693,45 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 			}
 		}
 	}
+	return errors.WithStack(err)
+}
+
+func PutURL(ctx context.Context, storage driver.Driver, dstDirPath, dstName, url string, lazyCache ...bool) error {
+	if storage.Config().CheckStatus && storage.GetStorage().Status != WORK {
+		return errors.Errorf("storage not init: %s", storage.GetStorage().Status)
+	}
+	dstDirPath = utils.FixAndCleanPath(dstDirPath)
+	_, err := GetUnwrap(ctx, storage, stdpath.Join(dstDirPath, dstName))
+	if err == nil {
+		return errors.New("obj already exists")
+	}
+	err = MakeDir(ctx, storage, dstDirPath)
+	if err != nil {
+		return errors.WithMessagef(err, "failed to put url")
+	}
+	dstDir, err := GetUnwrap(ctx, storage, dstDirPath)
+	if err != nil {
+		return errors.WithMessagef(err, "failed to put url")
+	}
+	switch s := storage.(type) {
+	case driver.PutURLResult:
+		var newObj model.Obj
+		newObj, err = s.PutURL(ctx, dstDir, dstName, url)
+		if err == nil {
+			if newObj != nil {
+				addCacheObj(storage, dstDirPath, model.WrapObjName(newObj))
+			} else if !utils.IsBool(lazyCache...) {
+				ClearCache(storage, dstDirPath)
+			}
+		}
+	case driver.PutURL:
+		err = s.PutURL(ctx, dstDir, dstName, url)
+		if err == nil && !utils.IsBool(lazyCache...) {
+			ClearCache(storage, dstDirPath)
+		}
+	default:
+		return errs.NotImplement
+	}
+	log.Debugf("put url [%s](%s) done", dstName, url)
 	return errors.WithStack(err)
 }

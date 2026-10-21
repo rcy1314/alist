@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 
+	"github.com/alist-org/alist/v3/internal/errs"
 	"github.com/alist-org/alist/v3/internal/model"
 	"github.com/alist-org/alist/v3/internal/op"
 	"github.com/alist-org/alist/v3/pkg/utils"
@@ -37,7 +39,17 @@ func (d *S3) initSession() error {
 		S3ForcePathStyle: aws.Bool(d.ForcePathStyle),
 	}
 	d.Session, err = session.NewSession(cfg)
-	return err
+	if err != nil {
+		return err
+	}
+	if d.UserAgent != "" {
+		// session-level so every client built from it (API client, uploader,
+		// presigner) sends the configured User-Agent
+		d.Session.Handlers.Build.PushBack(func(r *request.Request) {
+			r.HTTPRequest.Header.Set("User-Agent", d.UserAgent)
+		})
+	}
+	return nil
 }
 
 func (d *S3) getClient(link bool) *s3.S3 {
@@ -104,17 +116,20 @@ func (d *S3) listV1(prefix string, args model.ListArgs) ([]model.Obj, error) {
 			files = append(files, &file)
 		}
 		for _, object := range listObjectsResult.Contents {
+			if strings.HasSuffix(*object.Key, "/") {
+				continue
+			}
 			name := path.Base(*object.Key)
 			if !args.S3ShowPlaceholder && (name == getPlaceholderName(d.Placeholder) || name == d.Placeholder) {
 				continue
 			}
-			file := model.Object{
+			file := &model.Object{
 				//Id:        *object.Key,
 				Name:     name,
 				Size:     *object.Size,
 				Modified: *object.LastModified,
 			}
-			files = append(files, &file)
+			files = append(files, model.WrapObjStorageClass(file, aws.StringValue(object.StorageClass)))
 		}
 		if listObjectsResult.IsTruncated == nil {
 			return nil, errors.New("IsTruncated nil")
@@ -163,13 +178,13 @@ func (d *S3) listV2(prefix string, args model.ListArgs) ([]model.Obj, error) {
 			if !args.S3ShowPlaceholder && (name == getPlaceholderName(d.Placeholder) || name == d.Placeholder) {
 				continue
 			}
-			file := model.Object{
+			file := &model.Object{
 				//Id:        *object.Key,
 				Name:     name,
 				Size:     *object.Size,
 				Modified: *object.LastModified,
 			}
-			files = append(files, &file)
+			files = append(files, model.WrapObjStorageClass(file, aws.StringValue(object.StorageClass)))
 		}
 		if !aws.BoolValue(listObjectsResult.IsTruncated) {
 			break
@@ -198,17 +213,23 @@ func (d *S3) copyFile(ctx context.Context, src string, dst string) error {
 	dstKey := getKey(dst, false)
 	input := &s3.CopyObjectInput{
 		Bucket:     &d.Bucket,
-		CopySource: aws.String("/" + d.Bucket + "/" + srcKey),
+		CopySource: aws.String(url.PathEscape(d.Bucket + "/" + srcKey)),
 		Key:        &dstKey,
+	}
+	if storageClass := d.resolveStorageClass(); storageClass != nil {
+		input.StorageClass = storageClass
 	}
 	_, err := d.client.CopyObject(input)
 	return err
 }
 
 func (d *S3) copyDir(ctx context.Context, src string, dst string) error {
-	objs, err := op.List(ctx, d, src, model.ListArgs{S3ShowPlaceholder: true})
+	objs, err := op.List(ctx, d, src, model.ListArgs{S3ShowPlaceholder: true, Refresh: true})
 	if err != nil {
 		return err
+	}
+	if len(objs) == 0 && !d.UsePlaceholder {
+		return d.createDirMarker(ctx, dst)
 	}
 	for _, obj := range objs {
 		cSrc := path.Join(src, obj.GetName())
@@ -226,8 +247,13 @@ func (d *S3) copyDir(ctx context.Context, src string, dst string) error {
 }
 
 func (d *S3) removeDir(ctx context.Context, src string) error {
-	objs, err := op.List(ctx, d, src, model.ListArgs{})
+	d.cleanupDirArtifacts(src)
+
+	objs, err := op.List(ctx, d, src, model.ListArgs{Refresh: true})
 	if err != nil {
+		if errs.IsObjectNotFound(err) {
+			return nil
+		}
 		return err
 	}
 	for _, obj := range objs {
@@ -241,9 +267,14 @@ func (d *S3) removeDir(ctx context.Context, src string) error {
 			return err
 		}
 	}
+	d.cleanupDirArtifacts(src)
+	return nil
+}
+
+func (d *S3) cleanupDirArtifacts(src string) {
 	_ = d.removeFile(path.Join(src, getPlaceholderName(d.Placeholder)))
 	_ = d.removeFile(path.Join(src, d.Placeholder))
-	return nil
+	_ = d.removeFile(getKey(src, true))
 }
 
 func (d *S3) removeFile(src string) error {

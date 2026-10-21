@@ -1,6 +1,8 @@
 package model
 
-import "time"
+import (
+	"time"
+)
 
 type Storage struct {
 	ID              uint      `json:"id" gorm:"primaryKey"`                        // unique key
@@ -13,6 +15,7 @@ type Storage struct {
 	Remark          string    `json:"remark"`
 	Modified        time.Time `json:"modified"`
 	Disabled        bool      `json:"disabled"` // if disabled
+	DisableIndex    bool      `json:"disable_index"`
 	EnableSign      bool      `json:"enable_sign"`
 	Sort
 	Proxy
@@ -25,9 +28,11 @@ type Sort struct {
 }
 
 type Proxy struct {
-	WebProxy     bool   `json:"web_proxy"`
-	WebdavPolicy string `json:"webdav_policy"`
-	DownProxyUrl string `json:"down_proxy_url"`
+	WebProxy      bool   `json:"web_proxy"`
+	WebdavPolicy  string `json:"webdav_policy"`
+	ProxyRange    bool   `json:"proxy_range"`
+	DownProxyUrl  string `json:"down_proxy_url"`
+	DownProxySign bool   `json:"down_proxy_sign" gorm:"default:true"`
 }
 
 func (s *Storage) GetStorage() *Storage {

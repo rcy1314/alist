@@ -14,12 +14,16 @@ type Addition struct {
 	SecretAccessKey          string `json:"secret_access_key" required:"true"`
 	SessionToken             string `json:"session_token"`
 	CustomHost               string `json:"custom_host"`
+	EnableCustomHostPresign  bool   `json:"enable_custom_host_presign"`
 	SignURLExpire            int    `json:"sign_url_expire" type:"number" default:"4"`
 	Placeholder              string `json:"placeholder"`
 	ForcePathStyle           bool   `json:"force_path_style"`
 	ListObjectVersion        string `json:"list_object_version" type:"select" options:"v1,v2" default:"v1"`
+	UsePlaceholder           bool   `json:"use_placeholder" default:"true" help:"Create hidden placeholder file (for example .alist) to keep empty folders."`
 	RemoveBucket             bool   `json:"remove_bucket" help:"Remove bucket name from path when using custom host."`
+	UserAgent                string `json:"user_agent" help:"Some providers validate the client by User-Agent, e.g. CSTCloud data capsule (s3.cstcloud.cn) requires it to contain the app type the AccessKey was created for (such as rclone). Such providers usually gate presigned URLs the same way, so also enable Web Proxy for the storage. Leave empty to use the SDK default."`
 	AddFilenameToDisposition bool   `json:"add_filename_to_disposition" help:"Add filename to Content-Disposition header."`
+	StorageClass             string `json:"storage_class" type:"select" options:",standard,standard_ia,onezone_ia,intelligent_tiering,glacier,glacier_ir,deep_archive,archive" help:"Storage class for new objects. AWS and Tencent COS support different subsets (COS uses ARCHIVE/DEEP_ARCHIVE)."`
 }
 
 func init() {

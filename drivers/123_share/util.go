@@ -1,6 +1,7 @@
 package _123Share
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -19,9 +20,9 @@ import (
 )
 
 const (
-	Api          = "https://www.123pan.com/api"
-	AApi         = "https://www.123pan.com/a/api"
-	BApi         = "https://www.123pan.com/b/api"
+	Api          = "https://yun.123pan.com/api"
+	AApi         = "https://yun.123pan.com/a/api"
+	BApi         = "https://yun.123pan.com/b/api"
 	MainApi      = BApi
 	FileList     = MainApi + "/share/get"
 	DownloadInfo = MainApi + "/share/download/info"
@@ -52,10 +53,13 @@ func GetApi(rawUrl string) string {
 }
 
 func (d *Pan123Share) request(url string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
+	if d.ref != nil {
+		return d.ref.Request(url, method, callback, resp)
+	}
 	req := base.RestyClient.R()
 	req.SetHeaders(map[string]string{
-		"origin":        "https://www.123pan.com",
-		"referer":       "https://www.123pan.com/",
+		"origin":        "https://yun.123pan.com",
+		"referer":       "https://yun.123pan.com/",
 		"authorization": "Bearer " + d.AccessToken,
 		"user-agent":    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) alist-client",
 		"platform":      "web",
@@ -80,20 +84,19 @@ func (d *Pan123Share) request(url string, method string, callback base.ReqCallba
 	return body, nil
 }
 
-func (d *Pan123Share) getFiles(parentId string) ([]File, error) {
+func (d *Pan123Share) getFiles(ctx context.Context, parentId string) ([]File, error) {
 	page := 1
 	res := make([]File, 0)
 	for {
-		if !d.APIRateLimit(FileList) {
-			time.Sleep(time.Millisecond * 200)
-			continue
+		if err := d.APIRateLimit(ctx, FileList); err != nil {
+			return nil, err
 		}
 		var resp Files
 		query := map[string]string{
 			"limit":          "100",
 			"next":           "0",
-			"orderBy":        d.OrderBy,
-			"orderDirection": d.OrderDirection,
+			"orderBy":        "file_id",
+			"orderDirection": "desc",
 			"parentFileId":   parentId,
 			"Page":           strconv.Itoa(page),
 			"shareKey":       d.ShareKey,

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep the existing FreeBSD ABI baseline after its release files move to archives.
+release=14.3
+arch=${1:?Usage: build-freebsd.sh <386|amd64|arm64>}
+case "$arch" in
+  386) os_arch=i386; target=i386 ;;
+  amd64) os_arch=amd64; target=x86_64 ;;
+  arm64) os_arch=arm64; target=aarch64 ;;
+  *) echo "Unsupported FreeBSD architecture: $arch" >&2; exit 1 ;;
+esac
+
+work_dir=$(mktemp -d)
+trap 'rm -rf "$work_dir"' EXIT
+# Probe both required files on the runner before attempting a large download.
+# These mirrors have published 14.3 release directories, but availability can change.
+sources=(
+  "https://ftp.unicamp.br/pub/FreeBSD/releases/$os_arch/$release-RELEASE"
+  "https://ftp.fau.de/freebsd/releases/$os_arch/$release-RELEASE"
+  "https://mirror.opensource.iu.edu/FreeBSD/releases/$os_arch/$release-RELEASE"
+  "https://archive.freebsd.org/old-releases/$os_arch/$release-RELEASE"
+)
+downloaded=false
+for base_url in "${sources[@]}"; do
+  echo "::group::Probe $base_url"
+  ok=true
+  for file in MANIFEST base.txz; do
+    # A 0-0 range avoids transferring hundreds of MB during probes.
+    code=$(curl -L -sS -o /dev/null -w '%{http_code}' -r 0-0 \
+      --connect-timeout 5 --max-time 15 "$base_url/$file") || ok=false
+    echo "$file: HTTP ${code:-unreachable}"
+    [[ "$code" == "200" || "$code" == "206" ]] || ok=false
+  done
+  if [[ "$ok" != true ]]; then
+    echo "::endgroup::"
+    continue
+  fi
+  rm -f "$work_dir/MANIFEST" "$work_dir/base.txz"
+  if curl -fLsS --connect-timeout 10 --max-time 60 "$base_url/MANIFEST" -o "$work_dir/MANIFEST" &&
+     curl -fL --connect-timeout 10 --max-time 600 --retry 1 "$base_url/base.txz" -o "$work_dir/base.txz"; then
+    downloaded=true
+    echo "Download succeeded from $base_url"
+    echo "::endgroup::"
+    break
+  fi
+  echo "Download failed; trying next mirror"
+  echo "::endgroup::"
+done
+if [[ "$downloaded" != true ]]; then
+  echo "::error::Unable to download FreeBSD $release ($os_arch) from any mirror"
+  exit 1
+fi
+checksum=$(awk '$1 == "base.txz" { print $2 }' "$work_dir/MANIFEST")
+(cd "$work_dir"; printf '%s  base.txz\n' "$checksum" | sha256sum --check -)
+mkdir "$work_dir/sysroot"
+tar -xf "$work_dir/base.txz" -C "$work_dir/sysroot"
+
+if [ "$#" -ge 3 ]; then
+  ldflags=$3
+else
+  built_at=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+  git_commit=$(git rev-parse HEAD)
+  version=${GITHUB_REF:-dev}
+  version=${version#refs/tags/}
+  ldflags="-w -s
+  -X 'github.com/alist-org/alist/v3/internal/conf.BuiltAt=$built_at'
+  -X 'github.com/alist-org/alist/v3/internal/conf.GitAuthor=Xhofe'
+  -X 'github.com/alist-org/alist/v3/internal/conf.GitCommit=$git_commit'
+  -X 'github.com/alist-org/alist/v3/internal/conf.Version=$version'
+  -X 'github.com/alist-org/alist/v3/internal/conf.WebVersion=dev'"
+fi
+output=${2:-build/alist-freebsd-$arch}
+mkdir -p "$(dirname "$output")"
+CGO_ENABLED=1 GOOS=freebsd GOARCH="$arch" CGO_LDFLAGS=-fuse-ld=lld \
+  CC="clang --target=$target-unknown-freebsd$release --sysroot=$work_dir/sysroot" \
+  go build -o "$output" -ldflags="$ldflags" -tags=jsoniter .
